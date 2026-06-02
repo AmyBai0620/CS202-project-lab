@@ -1,0 +1,1511 @@
+CS202 考试现场：按题型改 asm 一页通
+适用场景：
+老师现场给出新指令，例如：
+    AAA s0, a0, a1
+    指令编码格式：xxxx
+    对应机器码：0x........
+    测试样例：
+        0,[sourcex1,sourcey1],expect_result1
+        0,[sourcex2,sourcey2],expect_result2
+
+
+============================================================
+0. sourcex 和 sourcey 
+============================================================
+
+sourcex / sourcey 不是寄存器名字，也不是 asm 里的变量。
+它们是老师测试样例给你的两个输入值。
+
+测试样例：
+    0,[sourcex,sourcey],expect_result
+
+在 Difftest 里通常对应：
+    0x4000 = 用例编号，一般就是 0
+    0x4004 = sourcex
+    0x4008 = sourcey
+    0x400c = 你的程序写回的 result
+
+所以最常见的 asm 开头是：
+
+    lui  gp, 0x00004      # gp = 0x4000
+    lw   a0, 4(gp)        # a0 = sourcex
+    lw   a1, 8(gp)        # a1 = sourcey
+
+最常见的 asm 结尾是：
+
+    sw   s0, 12(gp)       # result 写到 0x400c
+
+一句话：
+    sourcex 通常会被你的程序读进 a0。
+    sourcey 通常会被你的程序读进 a1。
+    expect_result 是老师希望最后 rd 0x400c 读到的值。
+
+
+============================================================
+1. 先按题目长相判断类型
+============================================================
+
+看到老师给的新指令，先看它长什么样：
+
+情况 A：
+    AAA s0, a0, a1
+    这是 R-Type 算术/逻辑类。
+    sourcex -> a0，sourcey -> a1。
+    最简单，只替换 add s0,a0,a1 的机器码。
+
+情况 B：
+    AAA s0, a0, imm
+    例如 AAA s0,a0,5
+    这是 I-Type 算术/逻辑类。
+    sourcex -> a0，sourcey 通常不用。
+    用 addi/slli/srli 占位。
+
+情况 C：
+    AAA s0, imm(a0)
+    例如 AAA s0,0(a0)
+    这是 Load 类。
+    为了测试稳定，sourcex 当作“要放进内存的数据”。
+    程序先把 sourcex 写到 0x4010，再用新 Load 读出来。
+
+情况 D：
+    AAA a1, imm(a0)
+    例如 AAA a1,0(a0)
+    这是 Store 类。
+    Store 没有 rd，不会写 s0。
+    最稳做法：让新 Store 直接把结果写到 0x400c。
+
+情况 E：
+    AAA a0, a1, label
+    或 AAA a0,a1,offset
+    这是 Branch 类。
+    Branch 不产生数值结果。
+    设计成：跳转成功写 1，不跳写 0。
+
+情况 F：
+    AAA s0, imm
+    例如 LUIN s0,0x12345
+    这是 U-Type 类。
+    sourcex/sourcey 通常不用。
+    用 lui s0,imm 占位。
+
+
+============================================================
+1.5 imm 不是 0 时
+============================================================
+
+先分清楚 imm 属于哪一类：
+
+1. I-Type 算术的 imm：
+    题目长相：
+        AAA s0, a0, 5
+        AAA s0, a0, -3
+
+    操作：
+        占位指令直接写同样的 imm。
+
+    例子：
+        AAA s0,a0,7
+        占位写：
+            addi s0, a0, 7
+
+        AAA s0,a0,-3
+        占位写：
+            addi s0, a0, -3
+
+    RARS 会自动把正数/负数 imm 编进机器码。
+    你只需要 dump 后替换 addi 那一行。
+
+2. 移位立即数 shamt：
+    题目长相：
+        AAA s0, a0, 4
+
+    如果它是移位类，推荐用移位占位：
+        slli s0, a0, 4
+    或：
+        srli s0, a0, 4
+
+    不要用 addi 也硬凑，因为移位类的 imm/shamt 字段位置比较特殊。
+
+3. Load 的 imm：
+    题目长相：
+        AAA s0, 4(a0)
+        AAA s0, -4(a0)
+
+    原则：
+        让 a0 + imm 指向一个安全临时地址，比如 0x4010。
+
+    imm = 4：
+        a0 应该是 0x400c，因为 0x400c + 4 = 0x4010。
+        写法：
+            addi a0, gp, 12       # a0 = 0x400c
+            sw   t0, 4(a0)        # MEM[0x4010] = sourcex
+            lw   s0, 4(a0)        # 占位，替换这行
+
+    imm = -4：
+        a0 应该是 0x4014，因为 0x4014 - 4 = 0x4010。
+        写法：
+            addi a0, gp, 20       # a0 = 0x4014
+            sw   t0, -4(a0)       # MEM[0x4010] = sourcex
+            lw   s0, -4(a0)       # 占位，替换这行
+
+    通用公式：
+        想让访问地址固定为 0x4010。
+        a0 = 0x4010 - imm。
+        因为 gp = 0x4000，所以：
+        addi a0, gp, (16 - imm)
+
+4. Store 的 imm：
+    题目长相：
+        AAA a1, 4(a0)
+        AAA a1, -4(a0)
+
+    原则：
+        让 a0 + imm = 0x400c。
+        因为 Difftest 最后读 0x400c。
+
+    imm = 4：
+        a0 应该是 0x4008。
+        写法：
+            addi a0, gp, 8
+            sw   a1, 4(a0)        # 占位，替换这行
+
+    imm = -4：
+        a0 应该是 0x4010。
+        写法：
+            addi a0, gp, 16
+            sw   a1, -4(a0)       # 占位，替换这行
+
+    通用公式：
+        想让写入地址固定为 0x400c。
+        a0 = 0x400c - imm。
+        因为 gp = 0x4000，所以：
+        addi a0, gp, (12 - imm)
+
+5. Branch 的 imm/offset：
+    Branch 的 imm 是 label 距离，不是 sourcex/sourcey。
+    不要自己随便填 0 或 4。
+    让 RARS 根据 label 自动算：
+        blt a0, a1, take
+
+    如果老师给完整机器码，就直接替换 branch 那一行。
+    如果老师只给 opcode/funct3，没有完整机器码，要按 B-Type 格式保留 label offset 后再改 opcode/funct3。
+
+
+============================================================
+2. 情况 A：R-Type，AAA s0,a0,a1
+============================================================
+
+题目长相：
+    AAA s0, a0, a1
+
+source 映射：
+    sourcex -> a0
+    sourcey -> a1
+
+asm 模板：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   a0, 4(gp)        # a0 = sourcex
+    lw   a1, 8(gp)        # a1 = sourcey
+
+    add  s0, a0, a1       # 占位，替换这条机器码
+
+    sw   s0, 12(gp)       # result -> 0x400c
+    jal  zero, loop
+
+你现场具体做：
+    1. asm 就写上面这个模板。
+    2. 用 RARS dump 出 txt。
+    3. 找到 add s0,a0,a1 的机器码：
+           00b50433
+    4. 把 00b50433 替换成老师给的机器码。
+       老师如果写 0x04B5040B，txt 里写：
+           04B5040B
+       不要写 0x。
+
+测试样例理解：
+    0,[5,6],11
+    程序运行时 a0=5，a1=6。
+    新指令算完写 s0，再 sw s0,12(gp) 到 0x400c。
+
+
+============================================================
+3. 情况 B：I-Type 算术，AAA s0,a0,imm
+============================================================
+
+题目长相：
+    AAA s0, a0, imm
+    例如 AAA s0,a0,5
+
+source 映射：
+    sourcex -> a0
+    sourcey 通常不用
+    imm 是机器码里的固定立即数，不是 sourcey
+
+asm 模板，普通立即数：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   a0, 4(gp)        # a0 = sourcex
+    lw   a1, 8(gp)        # 保留读取，通常不用
+
+    addi s0, a0, 5        # 占位，5 换成题目 imm
+
+    sw   s0, 12(gp)
+    jal  zero, loop
+
+你现场具体做：
+    1. 看题目 immediate 是多少。
+       如果题目是 AAA s0,a0,7，就写：
+           addi s0, a0, 7
+
+    2. 如果题目是移位立即数，例如 AAA s0,a0,4，
+       更推荐用同类移位占位：
+           slli s0, a0, 4
+       或：
+           srli s0, a0, 4
+       这样 RARS 生成的 shamt 位置一定对。
+
+    3. RARS dump 出 txt。
+
+    4. 找到 addi/slli/srli 那条占位机器码。
+       addi s0,a0,5 常见机器码是：
+           00550413
+       但 imm 不同机器码也不同，所以以 RARS dump 为准。
+
+    5. 把那一行替换成老师给的机器码。
+
+测试样例理解：
+    如果题目是 AAA s0,a0,5，功能是 a0 + 5：
+        0,[7,0],12
+    此时 sourcex=7 进 a0，sourcey=0 不参与。
+
+重要提醒：
+    如果老师给的多条测试里 sourcey 变化，并且 expect_result 也跟 sourcey 变化，
+    那这条指令大概率不是真正的 I-Type imm，而是 R-Type 用 a1。
+    因为 I-Type 的 imm 是机器码固定的，不能每条测试变。
+
+
+============================================================
+4. 情况 C：Load 类，AAA s0,imm(a0)
+============================================================
+
+题目长相：
+    AAA s0, imm(a0)
+    例如 AAA s0,0(a0)
+
+source 映射，推荐考场用法：
+    sourcex = 准备放到内存里的数据
+    sourcey = 通常不用
+    a0 = 临时内存地址 0x4010，不直接等于 sourcex
+
+为什么不让 a0=sourcex？
+    因为 sourcex 可能是 7、0xff、-1 这种数据，不一定是安全内存地址。
+    Load 指令需要 a0 当地址，所以我们自己指定 a0=0x4010。
+
+asm 模板，imm = 0：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   t0, 4(gp)        # t0 = sourcex，作为内存数据
+    lw   a1, 8(gp)        # sourcey，通常不用
+
+    addi a0, gp, 16       # a0 = 0x4010
+    sw   t0, 0(a0)        # MEM[0x4010] = sourcex
+
+    lw   s0, 0(a0)        # 占位，替换成新 Load 机器码
+
+    sw   s0, 12(gp)       # result -> 0x400c
+    jal  zero, loop
+
+你现场具体做：
+    1. 如果新指令是 word load 类，用 lw s0,imm(a0) 占位。
+    2. 如果新指令是 byte load 类，用 lb 或 lbu 占位。
+    3. 如果新指令是 half load 类，用 lh 或 lhu 占位。
+    4. RARS dump 出 txt。
+    5. 替换那条 load 占位机器码。
+
+常见 imm=0 占位机器码：
+    lb   s0, 0(a0)      = 00050403
+    lh   s0, 0(a0)      = 00051403
+    lw   s0, 0(a0)      = 00052403
+    lbu  s0, 0(a0)      = 00054403
+    lhu  s0, 0(a0)      = 00055403
+
+如果题目是 AAA s0,4(a0)：
+    你要把数据放到 a0+4。
+
+模板改成：
+
+    lw   t0, 4(gp)
+    lw   a1, 8(gp)
+
+    addi a0, gp, 16       # a0 = 0x4010
+    sw   t0, 4(a0)        # MEM[a0+4] = sourcex
+
+    lw   s0, 4(a0)        # 占位，替换成 AAA s0,4(a0)
+
+    sw   s0, 12(gp)
+    jal  zero, loop
+
+测试样例理解：
+    如果新指令功能是 LW2：s0 = MEM[a0] * 2
+    测试：
+        0,[7,0],14
+    程序会先把 7 写入 0x4010，再用新 Load 读出并计算。
+
+符号扩展测试：
+    如果是 LB 类：
+        sourcex = 0x000000ff
+        LB 期望可能是 0xffffffff
+        LBU 期望可能是 0x000000ff
+
+
+============================================================
+5. 情况 D：Store 类，AAA a1,imm(a0)
+============================================================
+
+题目长相：
+    AAA a1, imm(a0)
+    例如 AAA a1,0(a0)
+
+source 映射，推荐考场用法：
+    sourcex -> a1，作为要被 store 的数据
+    sourcey 通常不用
+    a0 指向 result 地址，让新 Store 直接写 0x400c
+
+为什么不能 sw s0,12(gp)？
+    Store 类新指令没有 rd，不会产生 s0。
+    它的结果就是“写进内存的值”。
+    所以必须让它写到 Difftest 会读的 0x400c。
+
+asm 模板，imm = 0：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   a1, 4(gp)        # a1 = sourcex，作为 store data
+    lw   t0, 8(gp)        # sourcey，通常不用
+
+    addi a0, gp, 12       # a0 = 0x400c
+
+    sw   a1, 0(a0)        # 占位，替换成新 Store 机器码
+
+    jal  zero, loop
+
+你现场具体做：
+    1. 保证 a1 是 sourcex。
+    2. 保证 a0 + imm = 0x400c。
+    3. RARS dump 出 txt。
+    4. 找到 sw a1,imm(a0) 那条。
+    5. 替换成老师给的新 Store 机器码。
+
+常见占位机器码：
+    sw a1,0(a0) = 00b52023
+
+如果题目是 AAA a1,4(a0)：
+    要让 a0+4 = 0x400c，所以 a0 = 0x4008。
+
+模板改成：
+
+    lw   a1, 4(gp)
+    lw   t0, 8(gp)
+
+    addi a0, gp, 8        # a0 = 0x4008，a0+4=0x400c
+
+    sw   a1, 4(a0)        # 占位，替换成 AAA a1,4(a0)
+
+    jal  zero, loop
+
+测试样例理解：
+    如果新指令 SW2 a1,0(a0)：MEM[a0] = a1 * 2
+    测试：
+        0,[9,0],18
+    sourcex=9 进 a1，新 Store 把 18 写到 0x400c。
+
+如果老师说 Store 用 sourcex 和 sourcey 两个数：
+    标准 S-Type 只有 rs1 地址和 rs2 数据。
+    a0 通常必须当地址，a1 当数据。
+    如果功能描述真的需要两个普通操作数，一定要问老师：
+        a0 是地址，还是 sourcex？
+    考试常规情况下，Store 类只变换 a1/rs2 后存。
+
+
+============================================================
+6. 情况 E：Branch 类，AAA a0,a1,label
+============================================================
+
+题目长相：
+    AAA a0, a1, label
+    或 AAA a0, a1, offset
+
+source 映射：
+    sourcex -> a0
+    sourcey -> a1
+
+Branch 不会产生 s0 结果。
+所以我们自己规定：
+    如果新分支跳转成功，result = 1。
+    如果新分支没有跳转，result = 0。
+
+asm 模板：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   a0, 4(gp)        # a0 = sourcex
+    lw   a1, 8(gp)        # a1 = sourcey
+
+    addi s0, zero, 0      # 默认不跳，result=0
+
+    blt  a0, a1, take     # 占位，替换成新 Branch 机器码
+
+    jal  zero, store
+
+take:
+    addi s0, zero, 1      # 跳转成功，result=1
+
+store:
+    sw   s0, 12(gp)
+    jal  zero, loop
+
+你现场具体做：
+    1. 先用 blt/beq/bne 任意一个普通 branch 占位。
+       如果新条件像“小于/小于等于”，用 blt 占位比较直观。
+       如果新条件像“等于”，用 beq 占位比较直观。
+
+    2. RARS dump 出 txt。
+
+    3. 找到 branch 占位那一行。
+       Branch 机器码不建议死背，因为 label 距离会影响立即数。
+
+    4. 如果老师给了“完整 32 位机器码”，直接替换那一行。
+       例如老师给 0x00B54A63，就在 txt 里写：
+           00B54A63
+
+    5. 如果老师只给 opcode/funct3/funct7，没有给完整机器码：
+       Branch 需要保留 label offset，不能随便写固定机器码。
+       这时要按 B-Type 格式计算，或者让负责 RTL/编码的队友一起算。
+
+B-Type 格式提醒：
+    imm12 | imm10:5 | rs2 | rs1 | funct3 | imm4:1 | imm11 | opcode
+
+测试样例理解：
+    如果新指令是 BLE a0,a1,take，即 a0 <= a1 时跳：
+        0,[3,5],1     # 3<=5，跳，result=1
+        0,[7,2],0     # 7<=2 不成立，不跳，result=0
+
+    如果新指令是 BGT a0,a1,take，即 a0 > a1 时跳：
+        0,[7,2],1
+        0,[3,5],0
+
+调试：
+    rd 0x400c = 1：说明跳到了 take。
+    rd 0x400c = 0：说明没有跳。
+    rd 0x400c = deadbeef：程序可能没执行到 store 或跑飞。
+
+
+============================================================
+7. 情况 F：U-Type，AAA s0,imm
+============================================================
+
+题目长相：
+    AAA s0, imm
+    例如 LUIN s0,0x12345
+
+source 映射：
+    sourcex 通常不用
+    sourcey 通常不用
+    imm 是机器码里的固定立即数
+
+asm 模板：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   a0, 4(gp)        # 保留读取，不用也没关系
+    lw   a1, 8(gp)
+
+    lui  s0, 0x12345      # 占位，imm 换成题目给的 imm
+
+    sw   s0, 12(gp)
+    jal  zero, loop
+
+你现场具体做：
+    1. 把 lui s0,imm 的 imm 改成题目给的 imm。
+    2. RARS dump 出 txt。
+    3. 找到 lui s0,imm 那一行。
+    4. 替换成老师给的新 U-Type 机器码。
+
+测试样例理解：
+    如果指令只依赖 imm，那么所有 sourcex/sourcey 不同的测试，结果都可能一样。
+    如果 expect_result 跟 sourcex/sourcey 变化，说明题目很可能不是纯 U-Type。
+
+
+============================================================
+8. 如果想顺手显示到数码管
+============================================================
+
+Difftest 只看 0x400c，数码管不是必须。
+
+如果结果在 s0 里，可以在 sw s0,12(gp) 后加：
+
+    lui  s10, 0x00010
+    sw   s0, 8(s10)       # 数码管地址 0x10008
+
+例如：
+
+    sw   s0, 12(gp)
+    lui  s10, 0x00010
+    sw   s0, 8(s10)
+    jal  zero, loop
+
+Store 类没有 s0 结果，不建议考试现场为了显示额外折腾。
+优先保证 0x400c 正确。
+
+
+============================================================
+8.5 wi / wd 这些命令是什么？从哪里来？
+============================================================
+
+这些不是 asm 文件里的代码。
+这些是 Difftest 工具的 CLI 命令，手动输入或粘贴到 Difftest 命令行里。
+
+重要：
+    你不是必须用 CLI。
+    如果 Difftest GUI 里有 Load Instruction Hex 和 TestCase Verify，
+    正式测试时完全可以直接用 GUI。
+
+    CLI 的作用是：
+        1. 手动把指令写进 IMem。
+        2. 手动把 sourcex/sourcey 写进 DMem。
+        3. 手动 rd 0x400c 排查错误。
+
+    TestCase Verify 的作用是：
+        1. 自动把每行测试样例里的 test_num/sourcex/sourcey 写进 DMem。
+        2. 自动 reset/run/halt。
+        3. 自动读 0x400c。
+        4. 自动和 expected_result 比较。
+
+    所以：
+        会用 TestCase Verify 就优先用 TestCase Verify。
+        出错时再用 CLI 查 ri/rd/reg/pc。
+
+1. wi 是写 Instruction Memory
+
+    wi = write instruction。
+    用来把 RARS 生成的机器码一行一行写进 CPU 的指令存储器 IMem。
+
+    例子：
+        wi 0x00 0x000041b7
+        wi 0x04 0x0041a503
+        wi 0x08 0x0081a583
+
+    前面的地址从哪里来？
+        第一条指令放 IMem 地址 0x00。
+        第二条指令放 IMem 地址 0x04。
+        第三条指令放 IMem 地址 0x08。
+        每条 RISC-V 指令 4 字节，所以地址每次 +4。
+
+    后面的机器码从哪里来？
+        来自 RARS dump 出来的 inst.txt。
+        如果 inst.txt 是：
+            000041b7
+            0041a503
+            0081a583
+            00b50433
+            0081a623
+
+        那 Difftest CLI 里就写：
+            wi 0x00 0x000041b7
+            wi 0x04 0x0041a503
+            wi 0x08 0x0081a583
+            wi 0x0c 0x00b50433
+            wi 0x10 0x0081a623
+
+        如果第 4 行 00b50433 已经被你替换成老师机器码，
+        那 wi 0x0c 后面也写替换后的机器码。
+
+2. wd 是写 Data Memory
+
+    wd = write data。
+    用来把老师测试样例的 sourcex/sourcey 写到数据内存 DMem。
+
+    老师样例：
+        0,[0x00000005,0x00000006],0x0000000b
+
+    对应 Difftest CLI：
+        wd 0x4000 0x00000000     # case id = 0
+        wd 0x4004 0x00000005     # sourcex = 5
+        wd 0x4008 0x00000006     # sourcey = 6
+        wd 0x400c 0xdeadbeef     # 先放垃圾值，确认程序真的覆盖它
+
+    expect_result 不用 wd 写进去。
+    expect_result 是你最后用 rd 0x400c 读出来后，拿来人工比较的值。
+
+3. rd 是读 Data Memory
+
+    rd = read data。
+    程序 run 完之后，用：
+        rd 0x400c
+
+    如果读出来等于老师样例的 expect_result，就是通过。
+
+4. 完整例子
+
+    老师样例：
+        0,[0x00000005,0x00000006],0x0000000b
+
+    你已经把 inst.txt 的 5 行写进 IMem：
+        000041b7
+        0041a503
+        0081a583
+        老师新机器码
+        0081a623
+
+    Difftest CLI 输入：
+        halt
+        reset
+        wi 0x00 0x000041b7
+        wi 0x04 0x0041a503
+        wi 0x08 0x0081a583
+        wi 0x0c 0x老师新机器码
+        wi 0x10 0x0081a623
+
+        wd 0x4000 0x00000000
+        wd 0x4004 0x00000005
+        wd 0x4008 0x00000006
+        wd 0x400c 0xdeadbeef
+
+        reset
+        run
+        等 0.5 秒
+        halt
+        rd 0x400c
+
+    最后 rd 0x400c 应该读到：
+        0x0000000b
+
+
+============================================================
+8.6 不用 CLI，直接用 TestCase Verify 怎么做？
+============================================================
+
+可以，推荐考场正式验收用这个。
+
+前提：
+    你的指令机器码 txt 已经准备好。
+    也就是 RARS dump 出 inst.txt 后，你已经把占位那一行替换成老师给的新机器码。
+
+步骤 1：准备机器码 txt
+
+    例子 inst.txt：
+        000041b7
+        0041a503
+        0081a583
+        老师新机器码
+        0081a623
+        fe000ee3
+
+    注意：
+        txt 里每行只写 8 位 hex。
+        不要写 0x。
+        不要写注释。
+
+步骤 2：Difftest GUI 连接板子
+
+    打开 Difftest GUI。
+    选择正确 COM 口。
+    Connect。
+    Ping 成功。
+
+步骤 3：加载指令
+
+    点击 Load Instruction Hex。
+    选择你刚刚改好的 inst.txt。
+
+    GUI 这一步本质上就是自动帮你做很多条 wi：
+        wi 0x00 第一行
+        wi 0x04 第二行
+        wi 0x08 第三行
+        ...
+
+    所以你用了 Load Instruction Hex，就不用手敲 wi。
+
+步骤 4：在 TestCase Verify 输入测试样例
+
+    格式必须严格：
+        test_num,[sourcex,sourcey],expected_result
+
+    例子：
+        0,[0x00000005,0x00000006],0x0000000b
+        0,[0x00000010,0x00000020],0x00000030
+
+    注意：
+        你们之前文档提醒过，中间最好不要加空格。
+        推荐写：
+            0,[0x5,0x6],0xb
+        不推荐写：
+            0, [0x5, 0x6], 0xb
+
+步骤 5：Run Batch Test
+
+    点击 Run Batch Test。
+
+    GUI 会自动对每一行样例做：
+        wd 0x4000 test_num
+        wd 0x4004 sourcex
+        wd 0x4008 sourcey
+        reset/run/halt
+        rd 0x400c
+        和 expected_result 比较
+
+    也就是说：
+        你用了 TestCase Verify，就不用手敲 wd 和 rd。
+
+什么时候还需要 CLI？
+
+    1. Load Instruction Hex 后仍然 FAIL：
+        用 CLI 的 ri 检查 IMem 第几条是不是老师机器码。
+
+    2. TestCase Verify FAIL，但不知道是输入没写对还是程序没写回：
+        用 rd 0x4004、rd 0x4008、rd 0x400c 查 DMem。
+
+    3. 想看 s0/a0/a1：
+        用 reg 8、reg 10、reg 11。
+
+    4. 想看程序跑飞没：
+        用 pc。
+
+结论：
+    正常流程：
+        Load Instruction Hex -> TestCase Verify -> Run Batch Test
+
+    Debug 流程：
+        CLI 查 ri/rd/reg/pc
+
+
+============================================================
+9. 最终考场操作顺序
+============================================================
+
+1. 看题目指令长相，选上面 A/B/C/D/E/F。
+
+2. 按对应模板写 asm。
+
+3. 不要在 asm 里写 AAA，写普通指令占位。
+
+4. RARS Assemble。
+
+5. Dump Memory，格式选 Hexadecimal Text，保存 txt。
+
+6. 打开 txt，找到占位那一行。
+
+7. 把占位那一行替换成老师给的 32 位机器码。
+   注意去掉 0x。
+
+8. 推荐用 GUI 加载指令：
+       Load Instruction Hex -> 选择替换后的 inst.txt
+
+   如果 GUI 不能加载，再用 CLI 手动 wi。
+
+9. 推荐用 TestCase Verify 跑样例：
+       输入：
+           0,[sourcex,sourcey],expect_result
+       点击 Run Batch Test。
+
+   如果 TestCase Verify FAIL，再用 CLI 手动 wd/rd/reg/pc 排查。
+
+10. TestCase Verify 显示 PASS，就是 asm/机器码测试流程通过。
+
+
+============================================================
+10. 最短选择表
+============================================================
+
+题目是 AAA s0,a0,a1：
+    sourcex->a0，sourcey->a1。
+    用 add s0,a0,a1 占位。
+    替换 00b50433。
+
+题目是 AAA s0,a0,imm：
+    sourcex->a0，sourcey不用。
+    用 addi s0,a0,imm 占位。
+    替换 addi 那一行。
+
+题目是 AAA s0,imm(a0)：
+    sourcex 先写进临时内存 0x4010。
+    a0 指向 0x4010。
+    用 lw/lb/lh s0,imm(a0) 占位。
+    替换 load 那一行。
+
+题目是 AAA a1,imm(a0)：
+    sourcex->a1。
+    让 a0+imm=0x400c。
+    用 sw a1,imm(a0) 占位。
+    替换 store 那一行。
+
+题目是 AAA a0,a1,label：
+    sourcex->a0，sourcey->a1。
+    跳转成功写 1，不跳写 0。
+    用 blt/beq 占位。
+    替换 branch 那一行。
+
+题目是 AAA s0,imm：
+    sourcex/sourcey 通常不用。
+    用 lui s0,imm 占位。
+    替换 lui 那一行。
+
+
+
+
+
+
+V2
+CS202 考试现场 asm 修改详细指南
+
+目标：
+老师现场给一条新指令时，你要能快速写 asm 占位、用 RARS 生成机器码 txt、替换占位机器码，并用 Difftest 跑测试。
+
+核心记忆：
+1. Difftest 输入输出协议固定：
+   0x4000 = case id，一般写 0
+   0x4004 = source x，也就是第一个操作数
+   0x4008 = source y，也就是第二个操作数
+   0x400c = result，程序必须把最终结果写到这里
+
+2. 你们工程里 gp(x3) reset 后已经是 0x4000。
+   但考试现场建议 asm 里仍然写：
+       lui gp, 0x00004
+   这样最稳，不依赖外部工具有没有初始化 gp。
+
+3. RARS 不认识老师的新指令，所以 asm 里先写普通 RV32I 指令占位。
+   RARS dump 出 txt 后，再把占位那一行 hex 替换成老师给的新指令机器码。
+
+4. txt 机器码文件里每行只写 8 位十六进制，不写 0x。
+   正确：
+       00b50433
+   错误：
+       0x00b50433
+
+5. 如果新指令是：
+       AAA s0, a0, a1
+   那就是最常见 R-Type，asm 结构不用变，只替换 add s0,a0,a1 那一行。
+
+
+============================================================
+一、通用 RARS 工作流
+============================================================
+
+步骤 1：新建或修改 asm 文件
+
+推荐文件名：
+    assembly/src_asm/exam_inst.asm
+
+步骤 2：写对应类型的 asm 模板
+
+先不要在 asm 里写 AAA，因为 RARS 不认识。
+用 add/addi/lw/sw/beq/blt 等普通指令占位。
+
+步骤 3：RARS 生成 txt
+
+RARS 菜单：
+    Run -> Assemble
+    File -> Dump Memory
+    Memory Segment 选 .text
+    Format 选 Hexadecimal Text
+    Dump To File 保存为 inst.txt
+
+步骤 4：打开 inst.txt，找到占位机器码，替换成老师给的新机器码
+
+常用占位机器码：
+    add  s0, a0, a1      = 00b50433
+    addi s0, a0, 5       = 00550413
+    lw   s0, 0(a0)       = 00052403
+    lb   s0, 0(a0)       = 00050403
+    lh   s0, 0(a0)       = 00051403
+    lbu  s0, 0(a0)       = 00054403
+    lhu  s0, 0(a0)       = 00055403
+    sw   a1, 0(a0)       = 00b52023
+
+注意：
+    如果 imm 不是 0 或 5，不要背机器码，直接看 RARS dump 出来的那一行。
+    替换时只替换占位那一行，其他行不要动。
+
+步骤 5：加载到 IMem
+
+路径 A：通过 Difftest CLI 写入：
+    halt
+    reset
+    wi 0x00 0x第一行机器码
+    wi 0x04 0x第二行机器码
+    wi 0x08 0x第三行机器码
+    ...
+
+路径 B：替换 Vivado INIT_FILE 对应的 batch_test.txt，再重新综合烧 bit。
+考试现场更推荐路径 A，因为不用反复综合。
+
+步骤 6：Difftest 写输入并检查结果
+
+每条测试样例都这样跑：
+    halt
+    reset
+    wd 0x4000 0x00000000
+    wd 0x4004 0x第一个操作数
+    wd 0x4008 0x第二个操作数
+    wd 0x400c 0xdeadbeef
+    reset
+    run
+    等 0.5 秒
+    halt
+    rd 0x400c
+
+rd 0x400c 读出来等于 expected result 就通过。
+
+
+============================================================
+二、R-Type 算术：AAA s0, a0, a1
+============================================================
+
+虽然你这次问的是 I/Load/Store/Branch，但 R-Type 最常见，先放一份最短模板。
+
+适用题型：
+    AAA s0, a0, a1
+    s0 = f(a0, a1)
+
+asm 模板：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   a0, 4(gp)
+    lw   a1, 8(gp)
+
+    add  s0, a0, a1        # 占位：替换 00b50433
+
+    sw   s0, 12(gp)
+    jal  zero, loop
+
+你要改哪里：
+    1. asm 基本不用改。
+    2. RARS 生成 txt 后，找到 00b50433。
+    3. 把 00b50433 替换成老师给的 AAA s0,a0,a1 机器码。
+
+测试样例写法：
+    0,[0x00000005,0x00000006],0x0000000b
+
+
+============================================================
+三、I-Type 算术：AAA s0, a0, imm
+============================================================
+
+适用题型：
+    AAA s0, a0, imm
+    s0 = f(a0, imm)
+
+典型例子：
+    MAXI s0, a0, 5
+    ROTRI s0, a0, 4
+    CLZI s0, a0, 0
+    NORI s0, a0, 0xff
+
+关键区别：
+    I-Type 只有一个寄存器输入 rs1，也就是 a0。
+    immediate 是写死在指令里的，不是运行时从 0x4008 读出来的。
+    所以 0x4008 的 source y 通常不用。
+
+推荐 asm 模板：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   a0, 4(gp)          # source x
+    lw   a1, 8(gp)          # 保留读取，很多测试格式会给 source y；不用也没关系
+
+    addi s0, a0, 5          # 占位：imm 要换成题目给的 imm
+
+    sw   s0, 12(gp)
+    jal  zero, loop
+
+具体怎么改：
+    1. 看老师题目里的 immediate。
+       例如 AAA s0,a0,7，就把占位写成：
+           addi s0, a0, 7
+
+    2. 如果是移位立即数类，建议用同类占位。
+       例如 AAA s0,a0,4 是 shift immediate，就写：
+           slli s0, a0, 4
+       或：
+           srli s0, a0, 4
+       这样 RARS 会帮你生成正确的 rd/rs1/shamt 位置。
+
+    3. RARS 生成 txt。
+
+    4. 找到占位那一行。
+       addi s0,a0,5 的机器码是：
+           00550413
+       但如果 imm 不是 5，以 RARS dump 为准。
+
+    5. 把占位机器码替换成老师给的新指令机器码。
+
+测试样例怎么理解：
+    如果老师给：
+        AAA s0,a0,5
+        功能 s0 = a0 + imm * 2
+    那测试可以是：
+        0,[0x00000003,0x00000000],0x0000000d
+    因为 3 + 5*2 = 13。
+    第二个操作数 0x4008 可以随便填，通常不参与。
+
+特别注意：
+    如果老师的测试样例里 source y 每条都不同，并且题目又说 AAA s0,a0,imm，
+    那 source y 不是 immediate。真正的 immediate 是机器码里写死的数。
+    这种情况要现场问清楚：到底是 I-Type imm，还是 R-Type rs2。
+
+
+============================================================
+四、I-Type Load：AAA s0, imm(a0)
+============================================================
+
+适用题型：
+    AAA s0, imm(a0)
+    s0 = f(MEM[a0 + imm])
+
+典型例子：
+    LBX s0, 0(a0)       # 类似 LB，但 opcode/funct 不同
+    LW2 s0, 0(a0)       # load word 后乘 2
+    LBN s0, 0(a0)       # load byte 后取负
+
+Load 类最容易混乱，因为 Difftest 只会给两个源操作数：
+    0x4004 = source x
+    0x4008 = source y
+
+推荐约定：
+    把 source x 当作“准备放进内存的数据”。
+    程序先把 source x 写到临时地址 0x4010，然后用新 Load 从 0x4010 读出来。
+    最后把新 Load 的结果写到 0x400c。
+
+最稳 asm 模板，imm = 0：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   t0, 4(gp)          # t0 = source x，准备放进内存
+    lw   a1, 8(gp)          # source y，通常不用
+
+    addi a0, gp, 16         # a0 = 0x4010，临时内存地址
+    sw   t0, 0(a0)          # MEM[0x4010] = source x
+
+    lw   s0, 0(a0)          # 占位：替换成新 Load 机器码
+
+    sw   s0, 12(gp)         # result -> 0x400c
+    jal  zero, loop
+
+你要改哪里：
+    1. 如果新指令是 word load 类，用 lw s0,imm(a0) 占位。
+    2. 如果新指令是 byte load 类，用 lb 或 lbu 占位。
+    3. 如果新指令是 half load 类，用 lh 或 lhu 占位。
+    4. RARS 生成 txt 后，替换那条 load 占位机器码。
+
+常见 load 占位机器码，imm=0：
+    lb   s0, 0(a0)      = 00050403
+    lh   s0, 0(a0)      = 00051403
+    lw   s0, 0(a0)      = 00052403
+    lbu  s0, 0(a0)      = 00054403
+    lhu  s0, 0(a0)      = 00055403
+
+如果题目 imm 不是 0：
+    例如 AAA s0, 4(a0)，你就这样写：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   t0, 4(gp)
+    lw   a1, 8(gp)
+
+    addi a0, gp, 16
+    sw   t0, 4(a0)          # 注意：把数据准备到 a0+4
+
+    lw   s0, 4(a0)          # 占位：替换成 AAA s0,4(a0)
+
+    sw   s0, 12(gp)
+    jal  zero, loop
+
+测试样例例子：
+    如果新指令是 LW2：s0 = MEM[a0] * 2
+    source x = 7
+    那程序会先把 7 写进 0x4010，然后新指令读出 7 并变成 14。
+    Difftest 用例：
+        0,[0x00000007,0x00000000],0x0000000e
+
+符号扩展测试：
+    如果是 LB 类，source x 只看低 8 位。
+    例如 source x = 0x000000ff：
+        LB 结果应该是 0xffffffff
+        LBU 结果应该是 0x000000ff
+
+
+============================================================
+五、S-Type Store：AAA a1, imm(a0)
+============================================================
+
+适用题型：
+    AAA a1, imm(a0)
+    MEM[a0 + imm] = f(a1)
+
+典型例子：
+    SWN a1, 0(a0)       # 存 -a1
+    SW2 a1, 0(a0)       # 存 a1 * 2
+    SWINV a1, 0(a0)     # 存 ~a1
+
+Store 类没有 rd，所以它不会把结果写进 s0。
+为了让 Difftest 能读到结果，最稳做法是：
+    直接让新 Store 把结果写到 0x400c。
+
+推荐 asm 模板，imm = 0：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   a1, 4(gp)          # a1 = source x，作为要 store 的数据
+    lw   t0, 8(gp)          # source y，通常不用
+
+    addi a0, gp, 12         # a0 = 0x400c，目标 result 地址
+
+    sw   a1, 0(a0)          # 占位：替换成新 Store 机器码
+
+    jal  zero, loop
+
+你要改哪里：
+    1. 保证 a1 放的是要被 store 的源数据。
+    2. 保证 a0 指向 0x400c，或者 a0+imm 等于 0x400c。
+    3. RARS 生成 txt 后，替换 sw a1,0(a0) 那一行。
+
+常用占位机器码：
+    sw a1, 0(a0) = 00b52023
+
+如果题目 imm 不是 0：
+    例如 AAA a1, 4(a0)，你要让 a0 + 4 = 0x400c。
+    所以 a0 = 0x4008。
+    写法：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   a1, 4(gp)
+    lw   t0, 8(gp)
+
+    addi a0, gp, 8          # a0 = 0x4008，a0+4 = 0x400c
+
+    sw   a1, 4(a0)          # 占位：替换成 AAA a1,4(a0)
+
+    jal  zero, loop
+
+测试样例例子：
+    如果新指令 SW2 a1,0(a0) 的功能是 MEM[a0] = a1 * 2：
+        source x = 9
+        expected result = 18
+    Difftest：
+        0,[0x00000009,0x00000000],0x00000012
+
+如果新 Store 需要两个普通操作数怎么办：
+    标准 S-Type 只有 rs1(base address) 和 rs2(store data)。
+    rs1 通常必须拿来当地址，所以新 Store 一般只能变换 rs2。
+    如果题目描述像“同时用 a0 和 a1 做计算再 store”，要现场问老师：
+        a0 是地址还是操作数？
+    按常规考试题，a0 是地址，a1 是被存的数据。
+
+
+============================================================
+六、B-Type Branch：AAA a0, a1, label
+============================================================
+
+适用题型：
+    AAA a0, a1, offset
+    如果条件成立，PC 跳到 label。
+
+典型例子：
+    BLE a0, a1, take       # a0 <= a1 时跳
+    BGT a0, a1, take       # a0 > a1 时跳
+    BEVEN a0, a1, take     # 某种自定义条件
+
+Branch 类不会直接产生数值结果。
+为了 Difftest 能验证，asm 要设计成：
+    跳转成功：写 result = 1
+    跳转失败：写 result = 0
+
+推荐 asm 模板：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+
+loop:
+    lw   a0, 4(gp)          # source x
+    lw   a1, 8(gp)          # source y
+
+    addi s0, zero, 0        # 默认：没有跳转，result = 0
+
+    blt  a0, a1, take       # 占位：替换成新 Branch 机器码
+
+    jal  zero, store
+
+take:
+    addi s0, zero, 1        # 跳转成功，result = 1
+
+store:
+    sw   s0, 12(gp)
+    jal  zero, loop
+
+你要改哪里：
+    1. 根据新分支条件，选一个普通 branch 占位。
+       如果新条件类似相等，用 beq 占位。
+       如果新条件类似小于，用 blt 占位。
+       如果不确定，用 blt 占位也可以，主要是让 RARS 生成正确 label offset。
+
+    2. RARS 生成 txt。
+
+    3. 找到那条 branch 占位机器码。
+
+    4. 替换成新 Branch 机器码。
+
+Branch 特别注意：
+    Branch 的机器码里包含 label 的偏移量。
+    所以如果老师给的是“这条具体 AAA a0,a1,take 的 32 位机器码”，可以直接替换。
+    如果老师只给 opcode/funct3，不给完整机器码，就不能随便写一个固定 hex。
+    你要保留 RARS 生成的 branch 立即数字段，只改 opcode/funct3。
+
+最简单现场做法：
+    让负责 RTL 的队友或者你自己按 B-Type 格式把机器码算出来。
+    B-Type 不是只改 asm 的问题，因为 offset 和 label 绑定。
+
+B-Type 编码格式：
+    imm12 | imm10:5 | rs2 | rs1 | funct3 | imm4:1 | imm11 | opcode
+
+常用寄存器：
+    rs1 = a0 = x10 = 01010
+    rs2 = a1 = x11 = 01011
+
+Branch 测试样例设计：
+    如果新指令是 BLE a0,a1,take，也就是 a0 <= a1 跳：
+        0,[0x00000003,0x00000005],0x00000001   # 3 <= 5，跳，结果 1
+        0,[0x00000007,0x00000002],0x00000000   # 7 <= 2，不跳，结果 0
+
+    如果新指令是 BGT a0,a1,take，也就是 a0 > a1 跳：
+        0,[0x00000007,0x00000002],0x00000001   # 跳
+        0,[0x00000003,0x00000005],0x00000000   # 不跳
+
+调试 Branch 的方法：
+    1. rd 0x400c 是 1，说明跳到了 take。
+    2. rd 0x400c 是 0，说明没有跳。
+    3. 如果 0x400c 还是 deadbeef，说明程序跑飞或没有执行到 sw。
+    4. 用 pc 命令看 PC 是否停在 loop 附近。
+
+
+============================================================
+七、上板数码管显示，可选
+============================================================
+
+Difftest 只看 0x400c。
+数码管只是给你肉眼观察，不是必须。
+
+如果新指令有 s0 结果，可以在 sw s0,12(gp) 后面加：
+
+    lui  s10, 0x00010
+    sw   s0, 8(s10)        # 写数码管 0x10008
+    sw   s0, 4(s10)        # 写 LED 0x10004，低 16 位有效
+
+完整例子：
+
+    sw   s0, 12(gp)
+    lui  s10, 0x00010
+    sw   s0, 8(s10)
+    jal  zero, loop
+
+注意：
+    Store 类新指令如果没有 s0，就不要强行显示 s0。
+    你可以在新 Store 前后另外计算一个用于显示的值，但考试现场优先保证 0x400c 正确。
+
+
+============================================================
+八、考试现场选择模板速查
+============================================================
+
+看到题目后先判断类型：
+
+1. AAA s0,a0,a1
+   用 R-Type 模板：
+       add s0,a0,a1 占位
+       替换 00b50433
+
+2. AAA s0,a0,imm
+   用 I-Type 算术模板：
+       addi s0,a0,imm 占位
+       替换 addi 那一行
+
+3. AAA s0,imm(a0)
+   用 Load 模板：
+       先把 source x 写到临时内存
+       lw/lb/lh s0,imm(a0) 占位
+       替换 load 那一行
+
+4. AAA a1,imm(a0)
+   用 Store 模板：
+       a1 = source x
+       a0 + imm = 0x400c
+       sw a1,imm(a0) 占位
+       替换 store 那一行
+
+5. AAA a0,a1,label
+   用 Branch 模板：
+       默认 s0=0
+       跳到 take 则 s0=1
+       sw s0,0x400c
+       替换 branch 那一行
+
+
+============================================================
+九、常见错误
+============================================================
+
+错误 1：asm 里直接写 AAA
+    RARS 不认识，会汇编失败。
+    正确做法：写 add/addi/lw/sw/branch 占位，生成 txt 后替换机器码。
+
+错误 2：txt 里写 0x
+    很多 IMem 初始化/wi 流程只要纯 hex。
+    正确：00b50433
+    错误：0x00b50433
+
+错误 3：忘记把 result 写到 0x400c
+    Difftest 必须 rd 0x400c 比对。
+    Store 类尤其容易忘，因为它没有 rd，要让新 Store 直接写 0x400c。
+
+错误 4：Branch 只写分支，不写结果
+    Branch 不会产生寄存器结果。
+    必须设计 taken=1、not taken=0，再 sw 到 0x400c。
+
+错误 5：Load 类直接从 source x 当地址读
+    source x 可能是 7、-1、0xff 这种数据，不一定是合法地址。
+    更稳做法：先把 source x 写到 0x4010，再从 0x4010 load。
+
+错误 6：I-Type 把 source y 当 immediate
+    immediate 是机器码的一部分，运行时不能从 0x4008 改。
+    如果测试样例依赖 source y，可能题目不是 I-Type，而是 R-Type。
+
+
+============================================================
+十、最短保命模板
+============================================================
+
+R-Type：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+loop:
+    lw   a0, 4(gp)
+    lw   a1, 8(gp)
+    add  s0, a0, a1
+    sw   s0, 12(gp)
+    jal  zero, loop
+
+I-Type：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+loop:
+    lw   a0, 4(gp)
+    addi s0, a0, 5
+    sw   s0, 12(gp)
+    jal  zero, loop
+
+Load：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+loop:
+    lw   t0, 4(gp)
+    addi a0, gp, 16
+    sw   t0, 0(a0)
+    lw   s0, 0(a0)
+    sw   s0, 12(gp)
+    jal  zero, loop
+
+Store：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+loop:
+    lw   a1, 4(gp)
+    addi a0, gp, 12
+    sw   a1, 0(a0)
+    jal  zero, loop
+
+Branch：
+
+.text
+.globl _start
+_start:
+    lui  gp, 0x00004
+loop:
+    lw   a0, 4(gp)
+    lw   a1, 8(gp)
+    addi s0, zero, 0
+    blt  a0, a1, take
+    jal  zero, store
+take:
+    addi s0, zero, 1
+store:
+    sw   s0, 12(gp)
+    jal  zero, loop
+
+
